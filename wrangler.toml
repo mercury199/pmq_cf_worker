@@ -1,0 +1,32 @@
+name = "pmq-pageview-bigquery"
+main = "src/worker.js"
+compatibility_date = "2026-11-01"
+
+# Bare domain + www for each clinic. These patterns do NOT match wickedfresh.* (Freshpaint),
+# so that subdomain is left alone.
+routes = [
+  { pattern = "atlanticmensclinic.com/*", zone_name = "atlanticmensclinic.com" },
+  { pattern = "www.atlanticmensclinic.com/*", zone_name = "atlanticmensclinic.com" },
+  { pattern = "heartlandmenshealth.com/*", zone_name = "heartlandmenshealth.com" },
+  { pattern = "www.heartlandmenshealth.com/*", zone_name = "heartlandmenshealth.com" },
+  { pattern = "northeastmenshealth.com/*", zone_name = "northeastmenshealth.com" },
+  { pattern = "www.northeastmenshealth.com/*", zone_name = "northeastmenshealth.com" },
+  { pattern = "rockymountainmensclinic.com/*", zone_name = "rockymountainmensclinic.com" },
+  { pattern = "www.rockymountainmensclinic.com/*", zone_name = "rockymountainmensclinic.com" },
+  { pattern = "tristatemenshealth.com/*", zone_name = "tristatemenshealth.com" },
+  { pattern = "www.tristatemenshealth.com/*", zone_name = "tristatemenshealth.com" },
+]
+
+[vars]
+GCP_PROJECT_ID = "REPLACE_ME"
+BQ_DATASET = "REPLACE_ME"
+BQ_TABLE = "pmq_page_views"
+GCP_SA_EMAIL = "REPLACE_ME@REPLACE_ME.iam.gserviceaccount.com"
+DEBUG = "0"
+
+# Secret (never put it in this file):
+#   wrangler secret put GCP_SA_PRIVATE_KEY
+# Paste the "private_key" value from the service account JSON key.
+
+[observability]
+enabled = true
