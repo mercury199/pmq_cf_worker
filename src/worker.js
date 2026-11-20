@@ -8,16 +8,18 @@
 // The Worker also mints the Wicked ID (__Host-pmq_sid, random UUID v4) so every row
 // can be joined to the Salesforce Lead's WT ID.
 //
-// Required configuration (wrangler.toml [vars] + secrets), supplied later:
-//   GCP_PROJECT_ID, BQ_DATASET, BQ_TABLE, GCP_SA_EMAIL   (vars)
-//   GCP_SA_PRIVATE_KEY                                    (secret: the service account's private_key PEM)
+// Destinations (configure either or both; each runs independently):
+//   BigQuery:  GCP_PROJECT_ID, BQ_DATASET, BQ_TABLE, GCP_SA_EMAIL   (vars)
+//              GCP_SA_PRIVATE_KEY                                   (secret: the service account's private_key PEM)
+//   Forward:   FORWARD_URL      (var: every row is POSTed there as JSON)
+//              FORWARD_SECRET   (optional secret: sent as the X-PMQ-Secret header)
 // Optional:
 //   DEBUG = "1"   -> logs each row to `wrangler tail`
 //
 // Nothing here ever blocks or breaks the page: all BigQuery work runs in ctx.waitUntil,
 // and passThroughOnException serves the origin untouched if anything throws.
 
-const WORKER_VERSION = '2026-11-20.1';
+const WORKER_VERSION = '2026-11-20.3';
 
 // ---- Same rules as the patched cookie script --------------------------------------
 const ALLOWED_PARAMS = [
@@ -51,7 +53,17 @@ const SID_COOKIE = '__Host-pmq_sid';        // __Host-: Secure, Path=/, no Domai
 const SID_MAX_AGE = 60 * 60 * 24 * 90;      // 90 days; align with the offline-conversion window
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-const BOT_UA = /bot|crawl|spider|slurp|facebookexternalhit|embedly|preview|lighthouse|pagespeed|headless|uptime|monitor|curl|wget|python-requests/i;
+// ---- Session (entrance) detection ------------------------------------------------------
+// A row is sent only when a session starts, using Google Analytics' rules:
+//   new_visitor  - no Wicked ID yet (first ever visit, or cookie cleared/expired)
+//   new_session  - Wicked ID exists, but no page view for SESSION_TIMEOUT_MIN minutes
+//   new_campaign - mid-session arrival with DIFFERENT ad params (e.g. clicked a second ad)
+// Reloading the same ad URL does not count as a new campaign (fingerprint check).
+const SES_COOKIE = '__Host-pmq_ses';        // value: <session uuid>.<campaign fingerprint>
+const SES_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-z]{0,13})$/;
+const DEFAULT_SESSION_TIMEOUT_MIN = 30;
+
+const BOT_UA =/bot|crawl|spider|slurp|facebookexternalhit|embedly|preview|lighthouse|pagespeed|headless|uptime|monitor|curl|wget|python-requests/i;
 const SKIP_PATH = /^\/(wp-admin|wp-json|wp-login\.php|wp-cron\.php|xmlrpc\.php|feed)\b/;
 
 export default {
@@ -76,17 +88,46 @@ export default {
     const isHtml = (res.headers.get('Content-Type') || '').includes('text/html');
     if (!isHtml || res.status >= 400) return res;
 
-    const row = buildRow({ request, url, cookies, cf, wtId, isNewSession, status: res.status });
-    ctx.waitUntil(insertRow(env, row).catch(err => console.error('[PMQ] BigQuery insert failed', String(err))));
-    if (env.DEBUG === '1') console.log('[PMQ] row', JSON.stringify(row));
+    // Is this page view the entrance of a session?
+    const ses = SES_RE.exec(cookies[SES_COOKIE] || '');
+    const params = allowedParams(url.searchParams);
+    const fp = Object.keys(params).length ? fingerprint(params) : '';
+    let sessionId = ses ? ses[1] : null;
+    let campaignFp = ses ? ses[2] : '';
+    let entryReason = null;
+    if (isNewSession) entryReason = 'new_visitor';
+    else if (!sessionId) entryReason = 'new_session';
+    else if (fp && fp !== campaignFp) entryReason = 'new_campaign';
+    if (entryReason) { sessionId = crypto.randomUUID(); campaignFp = fp; }
 
-    if (!isNewSession) return res;
+    if (entryReason) {
+      const row = buildRow({ request, url, cookies, cf, wtId, isNewSession, status: res.status, sessionId, entryReason });
+      ctx.waitUntil(sendRow(env, row));
+      if (env.DEBUG === '1') console.log('[PMQ] row', JSON.stringify(row));
+    } else if (env.DEBUG === '1') {
+      console.log('[PMQ] mid-session page view, not sent', url.pathname);
+    }
+
+    // Every tracked page view slides the session window forward (GA-style inactivity timeout).
+    const timeoutMin = Number(env.SESSION_TIMEOUT_MIN) > 0 ? Number(env.SESSION_TIMEOUT_MIN) : DEFAULT_SESSION_TIMEOUT_MIN;
     const out = new Response(res.body, res);
     out.headers.append('Set-Cookie',
-      `${SID_COOKIE}=${wtId}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SID_MAX_AGE}`);
+      `${SES_COOKIE}=${sessionId}.${campaignFp}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${timeoutMin * 60}`);
+    if (isNewSession) {
+      out.headers.append('Set-Cookie',
+        `${SID_COOKIE}=${wtId}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SID_MAX_AGE}`);
+    }
     return out;
   }
 };
+
+// Short, stable fingerprint of the ad params (FNV-1a, base36). Not security-sensitive.
+function fingerprint(params) {
+  const s = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36);
+}
 
 // ---- Request filtering --------------------------------------------------------------
 function isTrackablePageLoad(request) {
@@ -102,7 +143,7 @@ function isTrackablePageLoad(request) {
 }
 
 // ---- Row construction ---------------------------------------------------------------
-function buildRow({ request, url, cookies, cf, wtId, isNewSession, status }) {
+function buildRow({ request, url, cookies, cf, wtId, isNewSession, status, sessionId = null, entryReason = null }) {
   const now = new Date().toISOString();
   const params = allowedParams(url.searchParams);
   const adSource = classifySource(params);
@@ -116,7 +157,9 @@ function buildRow({ request, url, cookies, cf, wtId, isNewSession, status }) {
     event_id: crypto.randomUUID(),
     event_ts: now,
     wt_id: wtId,
-    is_new_session: isNewSession,
+    is_new_session: isNewSession,         // kept for compatibility: true = Wicked ID minted (new visitor)
+    session_id: sessionId,
+    entry_reason: entryReason,            // new_visitor | new_session | new_campaign
     has_tracking_cookie: !!tc,
 
     host,
@@ -238,11 +281,43 @@ function parseCookies(header) {
   return out;
 }
 
+// ---- Destinations ---------------------------------------------------------------------
+// BigQuery and FORWARD_URL are independent: each runs if configured, and one failing never
+// stops the other.
+const BQ_KEYS = ['GCP_PROJECT_ID', 'BQ_DATASET', 'BQ_TABLE', 'GCP_SA_EMAIL', 'GCP_SA_PRIVATE_KEY'];
+const isSet = v => !!v && v !== 'REPLACE_ME' && !String(v).startsWith('REPLACE_ME');
+
+async function sendRow(env, row) {
+  const jobs = [];
+  // BigQuery counts as "on" once GCP_PROJECT_ID is filled in; then every key must be set.
+  const bqSet = BQ_KEYS.filter(k => isSet(env[k]));
+  if (bqSet.length === BQ_KEYS.length) {
+    jobs.push(insertRow(env, row).catch(err => console.error('[PMQ] BigQuery insert failed', String(err))));
+  } else if (isSet(env.GCP_PROJECT_ID)) {
+    console.error('[PMQ] BigQuery partly configured, skipped. Missing:', BQ_KEYS.filter(k => !isSet(env[k])).join(', '));
+  }
+  if (isSet(env.FORWARD_URL)) {
+    jobs.push(forwardRow(env, row).catch(err => console.error('[PMQ] forward failed', String(err))));
+  }
+  if (!jobs.length) console.error('[PMQ] no destination configured (BigQuery or FORWARD_URL)');
+  await Promise.all(jobs);
+}
+
+// POSTs the same row object BigQuery receives, as a JSON body.
+async function forwardRow(env, row) {
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': `pmq-pageview-worker/${WORKER_VERSION}` };
+  if (env.FORWARD_SECRET) headers['X-PMQ-Secret'] = env.FORWARD_SECRET;   // optional shared secret
+  const res = await fetch(env.FORWARD_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(row),
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+}
+
 // ---- BigQuery streaming insert --------------------------------------------------------
 async function insertRow(env, row) {
-  for (const k of ['GCP_PROJECT_ID', 'BQ_DATASET', 'BQ_TABLE', 'GCP_SA_EMAIL', 'GCP_SA_PRIVATE_KEY']) {
-    if (!env[k]) throw new Error(`missing config ${k}`);
-  }
   const token = await getAccessToken(env);
   const endpoint = `https://bigquery.googleapis.com/bigquery/v2/projects/${env.GCP_PROJECT_ID}` +
     `/datasets/${env.BQ_DATASET}/tables/${env.BQ_TABLE}/insertAll`;
@@ -305,4 +380,4 @@ function b64url(bytes) {
 }
 
 // Exported for tests only.
-export const _test = { buildRow, isTrackablePageLoad, parseDevice, classifySource, importKey, getAccessToken, insertRow };
+export const _test = { buildRow, isTrackablePageLoad, parseDevice, classifySource, importKey, getAccessToken, insertRow, sendRow, forwardRow };

@@ -26,7 +26,15 @@ GCP_SA_EMAIL = "REPLACE_ME@REPLACE_ME.iam.gserviceaccount.com"
 DEBUG = "0"
 
 
+# Minutes of inactivity before the next page view counts as a new session (GA default: 30).
+SESSION_TIMEOUT_MIN = "30"
 
+# Optional: every row is also POSTed here as JSON. Leave empty ("") to turn off.
+# BigQuery keeps working independently when its values above are filled in.
+
+# Secrets (never put them in this file):
+#   wrangler secret put GCP_SA_PRIVATE_KEY   -> the "private_key" value from the service account JSON key
+#   wrangler secret put FORWARD_SECRET       -> optional; sent to FORWARD_URL as the X-PMQ-Secret header
 # Secret (never put it in this file):
 #   wrangler secret put GCP_SA_PRIVATE_KEY
 # Paste the "private_key" value from the service account JSON key.
