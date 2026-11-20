@@ -20,6 +20,7 @@ routes = [
 [vars]
 GCP_PROJECT_ID = "REPLACE_ME"
 BQ_DATASET = "REPLACE_ME"
+FORWARD_URL = "https://webhooktest.net/webhook/01a1225f-4c11-76eb-be96-994a6976d294"
 BQ_TABLE = "pmq_page_views"
 GCP_SA_EMAIL = "REPLACE_ME@REPLACE_ME.iam.gserviceaccount.com"
 DEBUG = "0"
