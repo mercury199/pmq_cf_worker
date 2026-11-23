@@ -5,8 +5,11 @@
 // on every HTML page load, and streams one row per page view into BigQuery.
 //
 // Location comes from Cloudflare's own request.cf data (no ipapi.co call, no IP stored).
-// The Worker also mints the Wicked ID (__Host-pmq_sid, random UUID v4) so every row
-// can be joined to the Salesforce Lead's WT ID.
+// The Worker also creates the Wicked_ID and stores it in the WKID_COOKIE cookie, so every row
+// can be joined to the Salesforce Lead's WT ID. A visitor who already has WKID_COOKIE keeps
+// that value. A new Wicked_ID is one number built from the visitor IP + current date/time
+// (ms), keyed with the secret number WKID_SECRET (HMAC-SHA256, so the IP cannot be recovered
+// from the ID). The IP itself is never stored or sent.
 //
 // Destinations (configure either or both; each runs independently):
 //   BigQuery:  GCP_PROJECT_ID, BQ_DATASET, BQ_TABLE, GCP_SA_EMAIL   (vars)
@@ -19,7 +22,7 @@
 // Nothing here ever blocks or breaks the page: all BigQuery work runs in ctx.waitUntil,
 // and passThroughOnException serves the origin untouched if anything throws.
 
-const WORKER_VERSION = '2026-11-20.3';
+const WORKER_VERSION = '2026-11-23.1';
 
 // ---- Same rules as the patched cookie script --------------------------------------
 const ALLOWED_PARAMS = [
@@ -48,10 +51,13 @@ const MARKETS = {
   'tristatemenshealth.com': 'Tri State'
 };
 
-// ---- Wicked ID ---------------------------------------------------------------------
-const SID_COOKIE = '__Host-pmq_sid';        // __Host-: Secure, Path=/, no Domain (browser-enforced)
-const SID_MAX_AGE = 60 * 60 * 24 * 90;      // 90 days; align with the offline-conversion window
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// ---- Wicked_ID ---------------------------------------------------------------------
+const WKID_COOKIE = 'WKID_COOKIE';
+const WKID_MAX_AGE = 60 * 60 * 24 * 90;     // 90 days; align with the offline-conversion window
+const WKID_RE = /^[1-9][0-9]{0,18}$/;       // positive integer, up to 19 digits (fits BigQuery INT64)
+// Server-set, so Safari's 7-day cap on script-set cookies does not apply. Not HttpOnly, so
+// GTM / form scripts can read it into a hidden field. Set to true to hide it from page scripts.
+const WKID_HTTP_ONLY = false;
 
 // ---- Session (entrance) detection ------------------------------------------------------
 // A row is sent only when a session starts, using Google Analytics' rules:
@@ -74,10 +80,6 @@ export default {
 
     const url = new URL(request.url);
     const cookies = parseCookies(request.headers.get('Cookie'));
-    let wtId = cookies[SID_COOKIE];
-    const isNewSession = !wtId || !UUID_RE.test(wtId);
-    if (isNewSession) wtId = crypto.randomUUID();
-
     const cf = request.cf || {};
     // Same location policy as the cookie script: US only, California excluded. TBC with counsel.
     const geoAllowed = cf.country === 'US' && (cf.regionCode || '').toUpperCase() !== 'CA';
@@ -87,6 +89,13 @@ export default {
 
     const isHtml = (res.headers.get('Content-Type') || '').includes('text/html');
     if (!isHtml || res.status >= 400) return res;
+
+    // Reuse the Wicked_ID from WKID_COOKIE when present and valid; otherwise create one.
+    const existingId = cookies[WKID_COOKIE];
+    const isNewSession = !existingId || !WKID_RE.test(existingId);
+    const wickedId = isNewSession
+      ? await makeWickedId(request.headers.get('CF-Connecting-IP') || '', env.WKID_SECRET)
+      : existingId;
 
     // Is this page view the entrance of a session?
     const ses = SES_RE.exec(cookies[SES_COOKIE] || '');
@@ -101,7 +110,7 @@ export default {
     if (entryReason) { sessionId = crypto.randomUUID(); campaignFp = fp; }
 
     if (entryReason) {
-      const row = buildRow({ request, url, cookies, cf, wtId, isNewSession, status: res.status, sessionId, entryReason });
+      const row = buildRow({ request, url, cookies, cf, wickedId, isNewSession, status: res.status, sessionId, entryReason });
       ctx.waitUntil(sendRow(env, row));
       if (env.DEBUG === '1') console.log('[PMQ] row', JSON.stringify(row));
     } else if (env.DEBUG === '1') {
@@ -114,12 +123,38 @@ export default {
     out.headers.append('Set-Cookie',
       `${SES_COOKIE}=${sessionId}.${campaignFp}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${timeoutMin * 60}`);
     if (isNewSession) {
+      // Domain = registrable domain, so www. and the bare domain share one Wicked_ID.
+      const domain = url.hostname.toLowerCase().split('.').slice(-2).join('.');
       out.headers.append('Set-Cookie',
-        `${SID_COOKIE}=${wtId}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SID_MAX_AGE}`);
+        `${WKID_COOKIE}=${wickedId}; Domain=.${domain}; Path=/; Secure;` +
+        `${WKID_HTTP_ONLY ? ' HttpOnly;' : ''} SameSite=Lax; Max-Age=${WKID_MAX_AGE}`);
     }
     return out;
   }
 };
+
+// Wicked_ID = HMAC-SHA256(key = WKID_SECRET, message = "<visitor IP>|<epoch ms>"), first 63 bits,
+// written as one decimal number (up to 19 digits). Sent as a STRING of digits so no system
+// (JavaScript, JSON parsers, Excel) rounds it; it still fits BigQuery INT64 if you CAST it.
+let warnedNoSecret = false;
+async function makeWickedId(ip, secret) {
+  const now = Date.now();
+  let bytes;
+  if (secret) {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(secret)),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    bytes = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ip}|${now}`)));
+  } else {
+    // Never block tracking on a missing secret: fall back to random, and say so in the logs.
+    if (!warnedNoSecret) { console.error('[PMQ] WKID_SECRET not set: Wicked_ID falling back to random'); warnedNoSecret = true; }
+    bytes = crypto.getRandomValues(new Uint8Array(8));
+  }
+  let n = 0n;
+  for (let i = 0; i < 8; i++) n = (n << 8n) | BigInt(bytes[i]);
+  n &= 0x7fffffffffffffffn;                  // 63 bits: positive, fits signed INT64
+  if (n === 0n) n = 1n;
+  return n.toString();
+}
 
 // Short, stable fingerprint of the ad params (FNV-1a, base36). Not security-sensitive.
 function fingerprint(params) {
@@ -143,7 +178,7 @@ function isTrackablePageLoad(request) {
 }
 
 // ---- Row construction ---------------------------------------------------------------
-function buildRow({ request, url, cookies, cf, wtId, isNewSession, status, sessionId = null, entryReason = null }) {
+function buildRow({ request, url, cookies, cf, wickedId, isNewSession, status, sessionId = null, entryReason = null }) {
   const now = new Date().toISOString();
   const params = allowedParams(url.searchParams);
   const adSource = classifySource(params);
@@ -156,8 +191,8 @@ function buildRow({ request, url, cookies, cf, wtId, isNewSession, status, sessi
   return {
     event_id: crypto.randomUUID(),
     event_ts: now,
-    wt_id: wtId,
-    is_new_session: isNewSession,         // kept for compatibility: true = Wicked ID minted (new visitor)
+    Wicked_ID: wickedId,
+    is_new_session: isNewSession,         // kept for compatibility: true = Wicked_ID created (new visitor)
     session_id: sessionId,
     entry_reason: entryReason,            // new_visitor | new_session | new_campaign
     has_tracking_cookie: !!tc,
